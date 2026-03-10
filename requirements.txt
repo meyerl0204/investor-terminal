@@ -1,5 +1,0 @@
-yfinance
-streamlit
-pandas
-altair
-anthropic
