@@ -6,7 +6,6 @@ import io
 from groq import Groq
 
 st.set_page_config(page_title="Pro Research Terminal", layout="wide")
-
 st.title("🏛️ Institutional Research Terminal")
 
 CSV_DATA = """Year,Max Drawdown %,Bottom-to-Year-End Return % (from max drawdown low),Full-Year Return %
@@ -63,366 +62,336 @@ CSV_DATA = """Year,Max Drawdown %,Bottom-to-Year-End Return % (from max drawdown
 2025,-10.2,0.0,0.0"""
 
 try:
-    df = pd.read_csv(io.StringIO(CSV_DATA))
-    df['Year'] = df['Year'].astype(int)
+    spx_df = pd.read_csv(io.StringIO(CSV_DATA))
+    spx_df['Year'] = spx_df['Year'].astype(int)
     election_years = [year for year in range(1976, 2028, 4)]
-    df['Year_Type'] = df['Year'].apply(lambda x: 'Election Year' if x in election_years else 'Standard Year')
+    spx_df['Year_Type'] = spx_df['Year'].apply(lambda x: 'Election Year' if x in election_years else 'Standard Year')
     st.sidebar.success("✅ Database Connected")
 except Exception as e:
     st.sidebar.error(f"❌ Data Error: {e}")
 
 st.sidebar.divider()
 st.sidebar.header("🤖 AI News Summaries")
-groq_api_key = st.sidebar.text_input(
-    "Groq API Key",
-    type="password",
-    help="Enter your free Groq API key. Get one free at console.groq.com"
-)
+groq_api_key = st.sidebar.text_input("Groq API Key", type="password",
+    help="Get a free key at console.groq.com")
 
-def extract_news_fields(news_item):
-    if 'content' in news_item:
-        content = news_item['content']
-        headline = content.get('title', '')
-        publisher = content.get('provider', {}).get('displayName', '') if isinstance(content.get('provider'), dict) else content.get('provider', '')
-        link = ''
-        if 'canonicalUrl' in content:
-            link = content['canonicalUrl'].get('url', '')
-        elif 'clickThroughUrl' in content:
-            link = content['clickThroughUrl'].get('url', '')
+# ── Session state defaults ──────────────────────────────────────────────────
+for key, val in [("analysis_done", False), ("price_range", "1Y"),
+                 ("ticker_loaded", ""), ("stock_info", {}),
+                 ("hist_full", None), ("financials", None),
+                 ("quarterly_fin", None), ("cashflow", None),
+                 ("quarterly_cf", None), ("recommendations", None),
+                 ("news_list", [])]:
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+def extract_news_fields(item):
+    if 'content' in item:
+        c = item['content']
+        headline = c.get('title', '')
+        publisher = c.get('provider', {}).get('displayName', '') if isinstance(c.get('provider'), dict) else c.get('provider', '')
+        link = c.get('canonicalUrl', {}).get('url', '') or c.get('clickThroughUrl', {}).get('url', '')
     else:
-        headline = news_item.get('title', '')
-        publisher = news_item.get('publisher', '')
-        link = news_item.get('link', '')
+        headline = item.get('title', '')
+        publisher = item.get('publisher', '')
+        link = item.get('link', '')
     return headline or 'No title', publisher or 'Unknown', link or '#'
 
 def get_ai_summary(ticker, headline, publisher, api_key):
     try:
         client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {
-                    "role": "system",
-                    "content": """You are a senior Wall Street analyst writing deep-dive news analysis for institutional investors.
-When given a news headline, provide a thorough, structured analysis covering:
-1. What exactly happened and why it matters
-2. Short-term price impact (bullish/bearish/neutral and why)
-3. Long-term implications for the stock
-4. Key risks or opportunities this creates
-5. What investors should watch for next
-Be specific, insightful, and professional. Write in paragraph form, not bullet points. Aim for 150-200 words."""
-                },
-                {
-                    "role": "user",
-                    "content": f"Ticker: {ticker}\nPublisher: {publisher}\nHeadline: {headline}\n\nProvide a deep institutional-grade analysis of this news."
-                }
-            ],
-            max_tokens=400,
-            temperature=0.3
-        )
-        return response.choices[0].message.content
+                {"role": "system", "content": """You are a senior Wall Street analyst. Provide deep-dive analysis for institutional investors covering:
+1. What happened and why it matters
+2. Short-term price impact (bullish/bearish/neutral)
+3. Long-term implications
+4. Key risks or opportunities
+5. What to watch next
+Write in paragraphs, 150-200 words, professional tone."""},
+                {"role": "user", "content": f"Ticker: {ticker}\nPublisher: {publisher}\nHeadline: {headline}\n\nProvide institutional-grade analysis."}
+            ], max_tokens=400, temperature=0.3)
+        return r.choices[0].message.content
     except Exception as e:
-        return f"⚠️ Could not generate summary: {str(e)}"
+        return f"⚠️ {str(e)}"
 
-def make_annual_chart(data, title, y_label, color="#4c9be8", format_billions=True):
+def bar_chart(data, y_label, color, format_billions=True, quarterly=False):
     if data is None or data.empty:
         return None
     data = data.reset_index()
     data.columns = ['Date', 'Value']
-    data['Date'] = pd.to_datetime(data['Date']).dt.year.astype(str)
+    if quarterly:
+        data['Date'] = pd.to_datetime(data['Date']).dt.to_period('Q').astype(str)
+    else:
+        data['Date'] = pd.to_datetime(data['Date']).dt.year.astype(str)
     if format_billions:
         data['Value'] = data['Value'] / 1e9
         label = f"{y_label} (B$)"
     else:
         label = y_label
     return alt.Chart(data).mark_bar(color=color).encode(
-        x=alt.X('Date:O', title='Year'),
+        x=alt.X('Date:O', title='Quarter' if quarterly else 'Year'),
         y=alt.Y('Value:Q', title=label),
         tooltip=['Date', alt.Tooltip('Value:Q', format='.2f')]
-    ).properties(height=220, padding={"top": 10})
+    ).properties(height=220)
 
-def make_quarterly_chart(data, title, y_label, color="#4c9be8", format_billions=True):
-    if data is None or data.empty:
-        return None
-    data = data.reset_index()
-    data.columns = ['Date', 'Value']
-    data['Date'] = pd.to_datetime(data['Date']).dt.to_period('Q').astype(str)
-    if format_billions:
-        data['Value'] = data['Value'] / 1e9
-        label = f"{y_label} (B$)"
-    else:
-        label = y_label
-    return alt.Chart(data).mark_bar(color=color, opacity=0.85).encode(
-        x=alt.X('Date:O', title='Quarter'),
-        y=alt.Y('Value:Q', title=label),
-        tooltip=['Date', alt.Tooltip('Value:Q', format='.2f')]
-    ).properties(height=220, padding={"top": 10})
-
+# ── Input + Generate button ─────────────────────────────────────────────────
 ticker_input = st.text_input("Enter Ticker (e.g., NVDA, TSLA, AAPL):", "NVDA").upper()
 
 if st.button("Generate Deep Analysis"):
     with st.spinner("Fetching data..."):
         try:
             stock = yf.Ticker(ticker_input)
-            info = stock.info
-
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Price", f"${info.get('currentPrice', 'N/A')}")
-            with col2:
-                st.metric("Wall St. Target", f"${info.get('targetMeanPrice', 'N/A')}")
-            with col3:
-                st.metric("Forward P/E", f"{info.get('forwardPE', 'N/A')}")
-            with col4:
-                inst_pct = info.get('heldPercentInstitutions', 0)
-                st.metric("Inst. Ownership", f"{inst_pct * 100:.1f}%" if inst_pct else "N/A")
-
-            st.divider()
-
-            # ── FULL PRICE HISTORY ─────────────────────────────────────────
-            # ── FULL PRICE HISTORY ─────────────────────────────────────────
-            st.header("📉 Price History")
-            try:
-                hist_full = stock.history(period="max")
-                if not hist_full.empty:
-                    hist_full = hist_full.reset_index()
-                    hist_full["Date"] = pd.to_datetime(hist_full["Date"].dt.date)
-
-                    # Time range buttons
-                    if "price_range" not in st.session_state:
-                        st.session_state["price_range"] = "1Y"
-
-                    time_labels = ["1W", "1M", "YTD", "1Y", "5Y", "10Y", "ALL"]
-                    btn_cols = st.columns(len(time_labels))
-                    for i, label in enumerate(time_labels):
-                        with btn_cols[i]:
-                            if st.button(label, key=f"btn_{label}", type="primary" if st.session_state["price_range"] == label else "secondary"):
-                                st.session_state["price_range"] = label
-
-                    selected = st.session_state["price_range"]
-                    today = pd.Timestamp.today().normalize()
-                    days_map = {"1W": 7, "1M": 30, "1Y": 365, "5Y": 1825, "10Y": 3650}
-
-                    if selected == "ALL":
-                        hist_filtered = hist_full.copy()
-                    elif selected == "YTD":
-                        hist_filtered = hist_full[hist_full["Date"] >= pd.Timestamp(today.year, 1, 1)]
-                    else:
-                        hist_filtered = hist_full[hist_full["Date"] >= today - pd.Timedelta(days=days_map[selected])]
-
-                    if hist_filtered.empty:
-                        hist_filtered = hist_full.copy()
-
-                    first_close = hist_filtered["Close"].iloc[0]
-                    last_close = hist_filtered["Close"].iloc[-1]
-                    line_color = "#2ecc71" if last_close >= first_close else "#e74c3c"
-                    pct_change = ((last_close - first_close) / first_close) * 100
-                    arrow = "▲" if pct_change >= 0 else "▼"
-                    st.caption(f"{arrow} {abs(pct_change):.2f}% over selected period  |  Current: ${last_close:.2f}")
-
-                    price_chart = alt.Chart(hist_filtered).mark_line(color=line_color, strokeWidth=1.8).encode(
-                        x=alt.X("Date:T", title="Date"),
-                        y=alt.Y("Close:Q", title="Price ($)", scale=alt.Scale(zero=False)),
-                        tooltip=[
-                            alt.Tooltip("Date:T", format="%b %d, %Y"),
-                            alt.Tooltip("Close:Q", format="$.2f", title="Price")
-                        ]
-                    ).properties(height=350).interactive()
-
-                    st.altair_chart(price_chart, use_container_width=True)
-                    ipo_year = hist_full["Date"].dt.year.min()
-                    st.caption(f"Full history available from {ipo_year} — {len(hist_full):,} trading days")
-            except Exception as e:
-                st.warning(f"Could not load price history: {e}")
-
-            st.divider()
-
-            # ── FINANCIAL KPIs ─────────────────────────────────────────────
-            st.header("📊 Financial KPIs")
-
-            try:
-                financials   = stock.financials
-                quarterly_fin = stock.quarterly_financials
-                cashflow     = stock.cashflow
-                quarterly_cf  = stock.quarterly_cashflow
-
-                kpi_tab1, kpi_tab2 = st.tabs(["📅 Annual (4 Years)", "📆 Quarterly (4 Quarters)"])
-
-                with kpi_tab1:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if financials is not None and 'Total Revenue' in financials.index:
-                            c = make_annual_chart(financials.loc['Total Revenue'].sort_index(), "Annual Revenue", "Revenue", "#2ecc71")
-                            if c:
-                                st.subheader("Annual Revenue")
-                                st.altair_chart(c, use_container_width=True)
-                    with c2:
-                        if financials is not None and 'Net Income' in financials.index:
-                            c = make_annual_chart(financials.loc['Net Income'].sort_index(), "Net Income", "Net Income", "#3498db")
-                            if c:
-                                st.subheader("Net Income")
-                                st.altair_chart(c, use_container_width=True)
-
-                    c3, c4 = st.columns(2)
-                    with c3:
-                        eps_row = None
-                        if financials is not None and 'Basic EPS' in financials.index:
-                            eps_row = financials.loc['Basic EPS'].sort_index()
-                            eps_label = "Basic EPS"
-                        elif financials is not None and 'Diluted EPS' in financials.index:
-                            eps_row = financials.loc['Diluted EPS'].sort_index()
-                            eps_label = "Diluted EPS"
-                        if eps_row is not None:
-                            c = make_annual_chart(eps_row, eps_label, "EPS ($)", "#9b59b6", format_billions=False)
-                            if c:
-                                st.subheader(eps_label)
-                                st.altair_chart(c, use_container_width=True)
-                    with c4:
-                        if cashflow is not None and 'Free Cash Flow' in cashflow.index:
-                            c = make_annual_chart(cashflow.loc['Free Cash Flow'].sort_index(), "Free Cash Flow", "FCF", "#e67e22")
-                            if c:
-                                st.subheader("Free Cash Flow")
-                                st.altair_chart(c, use_container_width=True)
-
-                    c5, c6 = st.columns(2)
-                    with c5:
-                        if financials is not None and 'Gross Profit' in financials.index:
-                            c = make_annual_chart(financials.loc['Gross Profit'].sort_index(), "Gross Profit", "Gross Profit", "#1abc9c")
-                            if c:
-                                st.subheader("Gross Profit")
-                                st.altair_chart(c, use_container_width=True)
-                    with c6:
-                        if financials is not None and 'Operating Income' in financials.index:
-                            c = make_annual_chart(financials.loc['Operating Income'].sort_index(), "Operating Income", "Operating Income", "#e74c3c")
-                            if c:
-                                st.subheader("Operating Income")
-                                st.altair_chart(c, use_container_width=True)
-
-                with kpi_tab2:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if quarterly_fin is not None and 'Total Revenue' in quarterly_fin.index:
-                            c = make_quarterly_chart(quarterly_fin.loc['Total Revenue'].sort_index(), "Quarterly Revenue", "Revenue", "#2ecc71")
-                            if c:
-                                st.subheader("Quarterly Revenue")
-                                st.altair_chart(c, use_container_width=True)
-                    with c2:
-                        if quarterly_fin is not None and 'Net Income' in quarterly_fin.index:
-                            c = make_quarterly_chart(quarterly_fin.loc['Net Income'].sort_index(), "Quarterly Net Income", "Net Income", "#3498db")
-                            if c:
-                                st.subheader("Quarterly Net Income")
-                                st.altair_chart(c, use_container_width=True)
-
-                    c3, c4 = st.columns(2)
-                    with c3:
-                        eps_row = None
-                        if quarterly_fin is not None and 'Basic EPS' in quarterly_fin.index:
-                            eps_row = quarterly_fin.loc['Basic EPS'].sort_index()
-                            eps_label = "Quarterly Basic EPS"
-                        elif quarterly_fin is not None and 'Diluted EPS' in quarterly_fin.index:
-                            eps_row = quarterly_fin.loc['Diluted EPS'].sort_index()
-                            eps_label = "Quarterly Diluted EPS"
-                        if eps_row is not None:
-                            c = make_quarterly_chart(eps_row, eps_label, "EPS ($)", "#9b59b6", format_billions=False)
-                            if c:
-                                st.subheader(eps_label)
-                                st.altair_chart(c, use_container_width=True)
-                    with c4:
-                        if quarterly_cf is not None and 'Free Cash Flow' in quarterly_cf.index:
-                            c = make_quarterly_chart(quarterly_cf.loc['Free Cash Flow'].sort_index(), "Quarterly Free Cash Flow", "FCF", "#e67e22")
-                            if c:
-                                st.subheader("Quarterly Free Cash Flow")
-                                st.altair_chart(c, use_container_width=True)
-
-                    c5, c6 = st.columns(2)
-                    with c5:
-                        if quarterly_fin is not None and 'Gross Profit' in quarterly_fin.index:
-                            c = make_quarterly_chart(quarterly_fin.loc['Gross Profit'].sort_index(), "Quarterly Gross Profit", "Gross Profit", "#1abc9c")
-                            if c:
-                                st.subheader("Quarterly Gross Profit")
-                                st.altair_chart(c, use_container_width=True)
-                    with c6:
-                        if quarterly_fin is not None and 'Operating Income' in quarterly_fin.index:
-                            c = make_quarterly_chart(quarterly_fin.loc['Operating Income'].sort_index(), "Quarterly Operating Income", "Operating Income", "#e74c3c")
-                            if c:
-                                st.subheader("Quarterly Operating Income")
-                                st.altair_chart(c, use_container_width=True)
-
-                # ── Key Ratios ──
-                st.subheader("📋 Key Ratios & Metrics")
-                k1, k2, k3, k4, k5 = st.columns(5)
-                with k1:
-                    st.metric("Market Cap", f"${info.get('marketCap', 0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
-                with k2:
-                    st.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A'):.1f}" if info.get('trailingPE') else "N/A")
-                with k3:
-                    st.metric("EV/EBITDA", f"{info.get('enterpriseToEbitda', 'N/A'):.1f}" if info.get('enterpriseToEbitda') else "N/A")
-                with k4:
-                    st.metric("Profit Margin", f"{info.get('profitMargins', 0)*100:.1f}%" if info.get('profitMargins') else "N/A")
-                with k5:
-                    st.metric("Debt/Equity", f"{info.get('debtToEquity', 'N/A'):.1f}" if info.get('debtToEquity') else "N/A")
-
-            except Exception as e:
-                st.warning(f"Could not load some financial data: {e}")
-
-            st.divider()
-
-            st.header("🏢 Wall Street Analyst Rankings")
-            recs = stock.recommendations
-            if recs is not None and not recs.empty:
-                st.dataframe(recs.tail(10), use_container_width=True)
-            else:
-                st.info("No recent analyst firm data available for this ticker.")
-
-            st.divider()
-
-            st.header("📈 S&P 500 Historical Recovery Chart")
-            st.write("Visualizing the 'Bottom-to-Year-End' bounce. Election years are **Red**.")
-
-            chart_data = df.copy()
-            recovery_col = 'Bottom-to-Year-End Return % (from max drawdown low)'
-            chart_data = chart_data.rename(columns={recovery_col: 'Recovery'})
-
-            recovery_chart = alt.Chart(chart_data).mark_bar().encode(
-                x=alt.X('Year:O', title='Year'),
-                y=alt.Y('Recovery:Q', title='Recovery % from Low'),
-                color=alt.Color('Year_Type:N',
-                                scale=alt.Scale(domain=['Election Year', 'Standard Year'],
-                                                range=['#ff4b4b', '#31333f']),
-                                title="Market Type"),
-                tooltip=['Year', 'Recovery', 'Year_Type']
-            ).properties(height=400)
-
-            st.altair_chart(recovery_chart, use_container_width=True)
-
-            st.divider()
-
-            st.header("🎙️ CEO Guidance & Earnings News")
-
-            if not groq_api_key:
-                st.info("💡 Enter your free Groq API key in the sidebar to get AI-powered deep analysis for each article.")
-
-            news_list = stock.news
-            if news_list:
-                for news_item in news_list[:5]:
-                    headline, publisher, link = extract_news_fields(news_item)
-                    with st.expander(f"📰 {publisher} — {headline}"):
-                        col_a, col_b = st.columns([3, 1])
-                        with col_a:
-                            st.markdown(f"**Source:** {publisher}")
-                        with col_b:
-                            if link != '#':
-                                st.markdown(f"🔗 [Read Full Article]({link})")
-                        st.divider()
-                        if groq_api_key:
-                            with st.spinner("🤖 Generating deep analysis..."):
-                                summary = get_ai_summary(ticker_input, headline, publisher, groq_api_key)
-                            st.markdown("### 🤖 AI Deep Analysis")
-                            st.markdown(summary)
-                        else:
-                            st.caption("🔒 Add your Groq API key in the sidebar to unlock AI deep analysis.")
-            else:
-                st.write("No recent news found.")
-
+            st.session_state["stock_info"]       = stock.info
+            st.session_state["hist_full"]        = stock.history(period="max")
+            st.session_state["financials"]       = stock.financials
+            st.session_state["quarterly_fin"]    = stock.quarterly_financials
+            st.session_state["cashflow"]         = stock.cashflow
+            st.session_state["quarterly_cf"]     = stock.quarterly_cashflow
+            st.session_state["recommendations"]  = stock.recommendations
+            st.session_state["news_list"]        = stock.news or []
+            st.session_state["ticker_loaded"]    = ticker_input
+            st.session_state["analysis_done"]    = True
+            st.session_state["price_range"]      = "1Y"
         except Exception as e:
-            st.error(f"Error fetching data for {ticker_input}: {e}")
+            st.error(f"Error fetching data: {e}")
+
+# ── Render results if analysis has been run ──────────────────────────────────
+if st.session_state["analysis_done"]:
+    info         = st.session_state["stock_info"]
+    hist_full    = st.session_state["hist_full"]
+    financials   = st.session_state["financials"]
+    quarterly_fin= st.session_state["quarterly_fin"]
+    cashflow     = st.session_state["cashflow"]
+    quarterly_cf = st.session_state["quarterly_cf"]
+    recs         = st.session_state["recommendations"]
+    news_list    = st.session_state["news_list"]
+    loaded_ticker= st.session_state["ticker_loaded"]
+
+    # ── Top metrics ──
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Price", f"${info.get('currentPrice', 'N/A')}")
+    with col2:
+        st.metric("Wall St. Target", f"${info.get('targetMeanPrice', 'N/A')}")
+    with col3:
+        st.metric("Forward P/E", f"{info.get('forwardPE', 'N/A')}")
+    with col4:
+        inst_pct = info.get('heldPercentInstitutions', 0)
+        st.metric("Inst. Ownership", f"{inst_pct*100:.1f}%" if inst_pct else "N/A")
+
+    st.divider()
+
+    # ── Price History ────────────────────────────────────────────────────────
+    st.header("📉 Price History")
+    if hist_full is not None and not hist_full.empty:
+        hist_full = hist_full.reset_index()
+        hist_full["Date"] = pd.to_datetime(hist_full["Date"].dt.date)
+
+        # Time range buttons — use on_click to update session state only
+        time_labels = ["1W", "1M", "YTD", "1Y", "5Y", "10Y", "ALL"]
+        btn_cols = st.columns(len(time_labels))
+        for i, label in enumerate(time_labels):
+            with btn_cols[i]:
+                if st.button(label, key=f"pr_{label}",
+                             type="primary" if st.session_state["price_range"] == label else "secondary"):
+                    st.session_state["price_range"] = label
+
+        selected = st.session_state["price_range"]
+        today = pd.Timestamp.today().normalize()
+        days_map = {"1W": 7, "1M": 30, "1Y": 365, "5Y": 1825, "10Y": 3650}
+
+        if selected == "ALL":
+            hist_f = hist_full.copy()
+        elif selected == "YTD":
+            hist_f = hist_full[hist_full["Date"] >= pd.Timestamp(today.year, 1, 1)]
+        else:
+            hist_f = hist_full[hist_full["Date"] >= today - pd.Timedelta(days=days_map[selected])]
+
+        if hist_f.empty:
+            hist_f = hist_full.copy()
+
+        first_c = hist_f["Close"].iloc[0]
+        last_c  = hist_f["Close"].iloc[-1]
+        pct     = ((last_c - first_c) / first_c) * 100
+        color   = "#2ecc71" if pct >= 0 else "#e74c3c"
+        arrow   = "▲" if pct >= 0 else "▼"
+        st.caption(f"{arrow} {abs(pct):.2f}% over selected period  |  Current: ${last_c:.2f}")
+
+        chart = alt.Chart(hist_f).mark_line(color=color, strokeWidth=1.8).encode(
+            x=alt.X("Date:T", title="Date"),
+            y=alt.Y("Close:Q", title="Price ($)", scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("Date:T", format="%b %d, %Y"),
+                     alt.Tooltip("Close:Q", format="$.2f", title="Price")]
+        ).properties(height=350).interactive()
+        st.altair_chart(chart, use_container_width=True)
+        ipo_year = hist_full["Date"].dt.year.min()
+        st.caption(f"Full history from {ipo_year} — {len(hist_full):,} trading days")
+
+    st.divider()
+
+    # ── Financial KPIs ───────────────────────────────────────────────────────
+    st.header("📊 Financial KPIs")
+    kpi_tab1, kpi_tab2 = st.tabs(["📅 Annual (4 Years)", "📆 Quarterly (4 Quarters)"])
+
+    with kpi_tab1:
+        c1, c2 = st.columns(2)
+        with c1:
+            if financials is not None and 'Total Revenue' in financials.index:
+                ch = bar_chart(financials.loc['Total Revenue'].sort_index(), "Revenue", "#2ecc71")
+                if ch:
+                    st.subheader("Annual Revenue")
+                    st.altair_chart(ch, use_container_width=True)
+        with c2:
+            if financials is not None and 'Net Income' in financials.index:
+                ch = bar_chart(financials.loc['Net Income'].sort_index(), "Net Income", "#3498db")
+                if ch:
+                    st.subheader("Net Income")
+                    st.altair_chart(ch, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            eps_row, eps_lbl = None, ""
+            if financials is not None and 'Basic EPS' in financials.index:
+                eps_row, eps_lbl = financials.loc['Basic EPS'].sort_index(), "Basic EPS"
+            elif financials is not None and 'Diluted EPS' in financials.index:
+                eps_row, eps_lbl = financials.loc['Diluted EPS'].sort_index(), "Diluted EPS"
+            if eps_row is not None:
+                ch = bar_chart(eps_row, "EPS ($)", "#9b59b6", format_billions=False)
+                if ch:
+                    st.subheader(eps_lbl)
+                    st.altair_chart(ch, use_container_width=True)
+        with c4:
+            if cashflow is not None and 'Free Cash Flow' in cashflow.index:
+                ch = bar_chart(cashflow.loc['Free Cash Flow'].sort_index(), "FCF", "#e67e22")
+                if ch:
+                    st.subheader("Free Cash Flow")
+                    st.altair_chart(ch, use_container_width=True)
+        c5, c6 = st.columns(2)
+        with c5:
+            if financials is not None and 'Gross Profit' in financials.index:
+                ch = bar_chart(financials.loc['Gross Profit'].sort_index(), "Gross Profit", "#1abc9c")
+                if ch:
+                    st.subheader("Gross Profit")
+                    st.altair_chart(ch, use_container_width=True)
+        with c6:
+            if financials is not None and 'Operating Income' in financials.index:
+                ch = bar_chart(financials.loc['Operating Income'].sort_index(), "Operating Income", "#e74c3c")
+                if ch:
+                    st.subheader("Operating Income")
+                    st.altair_chart(ch, use_container_width=True)
+
+    with kpi_tab2:
+        c1, c2 = st.columns(2)
+        with c1:
+            if quarterly_fin is not None and 'Total Revenue' in quarterly_fin.index:
+                ch = bar_chart(quarterly_fin.loc['Total Revenue'].sort_index(), "Revenue", "#2ecc71", quarterly=True)
+                if ch:
+                    st.subheader("Quarterly Revenue")
+                    st.altair_chart(ch, use_container_width=True)
+        with c2:
+            if quarterly_fin is not None and 'Net Income' in quarterly_fin.index:
+                ch = bar_chart(quarterly_fin.loc['Net Income'].sort_index(), "Net Income", "#3498db", quarterly=True)
+                if ch:
+                    st.subheader("Quarterly Net Income")
+                    st.altair_chart(ch, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            eps_row, eps_lbl = None, ""
+            if quarterly_fin is not None and 'Basic EPS' in quarterly_fin.index:
+                eps_row, eps_lbl = quarterly_fin.loc['Basic EPS'].sort_index(), "Quarterly Basic EPS"
+            elif quarterly_fin is not None and 'Diluted EPS' in quarterly_fin.index:
+                eps_row, eps_lbl = quarterly_fin.loc['Diluted EPS'].sort_index(), "Quarterly Diluted EPS"
+            if eps_row is not None:
+                ch = bar_chart(eps_row, "EPS ($)", "#9b59b6", format_billions=False, quarterly=True)
+                if ch:
+                    st.subheader(eps_lbl)
+                    st.altair_chart(ch, use_container_width=True)
+        with c4:
+            if quarterly_cf is not None and 'Free Cash Flow' in quarterly_cf.index:
+                ch = bar_chart(quarterly_cf.loc['Free Cash Flow'].sort_index(), "FCF", "#e67e22", quarterly=True)
+                if ch:
+                    st.subheader("Quarterly Free Cash Flow")
+                    st.altair_chart(ch, use_container_width=True)
+        c5, c6 = st.columns(2)
+        with c5:
+            if quarterly_fin is not None and 'Gross Profit' in quarterly_fin.index:
+                ch = bar_chart(quarterly_fin.loc['Gross Profit'].sort_index(), "Gross Profit", "#1abc9c", quarterly=True)
+                if ch:
+                    st.subheader("Quarterly Gross Profit")
+                    st.altair_chart(ch, use_container_width=True)
+        with c6:
+            if quarterly_fin is not None and 'Operating Income' in quarterly_fin.index:
+                ch = bar_chart(quarterly_fin.loc['Operating Income'].sort_index(), "Operating Income", "#e74c3c", quarterly=True)
+                if ch:
+                    st.subheader("Quarterly Operating Income")
+                    st.altair_chart(ch, use_container_width=True)
+
+    # ── Key Ratios ──
+    st.subheader("📋 Key Ratios & Metrics")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Market Cap", f"${info.get('marketCap',0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
+    with k2:
+        st.metric("P/E Ratio", f"{info.get('trailingPE'):.1f}" if info.get('trailingPE') else "N/A")
+    with k3:
+        st.metric("EV/EBITDA", f"{info.get('enterpriseToEbitda'):.1f}" if info.get('enterpriseToEbitda') else "N/A")
+    with k4:
+        st.metric("Profit Margin", f"{info.get('profitMargins',0)*100:.1f}%" if info.get('profitMargins') else "N/A")
+    with k5:
+        st.metric("Debt/Equity", f"{info.get('debtToEquity'):.1f}" if info.get('debtToEquity') else "N/A")
+
+    st.divider()
+
+    # ── Analyst Rankings ─────────────────────────────────────────────────────
+    st.header("🏢 Wall Street Analyst Rankings")
+    if recs is not None and not recs.empty:
+        st.dataframe(recs.tail(10), use_container_width=True)
+    else:
+        st.info("No recent analyst data available.")
+
+    st.divider()
+
+    # ── S&P 500 Recovery Chart ───────────────────────────────────────────────
+    st.header("📈 S&P 500 Historical Recovery Chart")
+    st.write("Visualizing the 'Bottom-to-Year-End' bounce. Election years are **Red**.")
+    recovery_col = 'Bottom-to-Year-End Return % (from max drawdown low)'
+    chart_data = spx_df.rename(columns={recovery_col: 'Recovery'})
+    recovery_chart = alt.Chart(chart_data).mark_bar().encode(
+        x=alt.X('Year:O', title='Year'),
+        y=alt.Y('Recovery:Q', title='Recovery % from Low'),
+        color=alt.Color('Year_Type:N',
+                        scale=alt.Scale(domain=['Election Year', 'Standard Year'],
+                                        range=['#ff4b4b', '#31333f']),
+                        title="Market Type"),
+        tooltip=['Year', 'Recovery', 'Year_Type']
+    ).properties(height=400)
+    st.altair_chart(recovery_chart, use_container_width=True)
+
+    st.divider()
+
+    # ── News + AI Analysis ───────────────────────────────────────────────────
+    st.header("🎙️ CEO Guidance & Earnings News")
+    if not groq_api_key:
+        st.info("💡 Enter your Groq API key in the sidebar for AI-powered deep analysis.")
+
+    if news_list:
+        for item in news_list[:5]:
+            headline, publisher, link = extract_news_fields(item)
+            with st.expander(f"📰 {publisher} — {headline}"):
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    st.markdown(f"**Source:** {publisher}")
+                with col_b:
+                    if link != '#':
+                        st.markdown(f"🔗 [Read Full Article]({link})")
+                st.divider()
+                if groq_api_key:
+                    with st.spinner("🤖 Generating deep analysis..."):
+                        summary = get_ai_summary(loaded_ticker, headline, publisher, groq_api_key)
+                    st.markdown("### 🤖 AI Deep Analysis")
+                    st.markdown(summary)
+                else:
+                    st.caption("🔒 Add your Groq API key to unlock AI deep analysis.")
+    else:
+        st.write("No recent news found.")
