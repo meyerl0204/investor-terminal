@@ -349,7 +349,7 @@ if st.session_state["analysis_done"]:
         if "Date" not in hf.columns and "date" in hf.columns:
             hf = hf.rename(columns={"date": "Date"})
         if "Date" in hf.columns and "Close" in hf.columns:
-            hf["Date"] = pd.to_datetime(hf["Date"])
+            hf["Date"] = pd.to_datetime(hf["Date"]).dt.tz_localize(None)
             hf = hf.sort_values("Date")
             today = pd.Timestamp.today().normalize()
             days_map = {"1W": 7, "1M": 30, "1Y": 365, "5Y": 1825, "ALL": 99999}
