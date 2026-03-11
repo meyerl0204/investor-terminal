@@ -261,30 +261,120 @@ ticker_input = st.text_input("Enter Ticker (e.g., NVDA, TSLA, AAPL):", "").upper
 if st.button("Generate Deep Analysis"):
     with st.spinner("Fetching data..."):
         try:
-            stock = yf.Ticker(ticker_input)
-            st.session_state["stock_info"]       = stock.info
-            st.session_state["hist_full"]        = stock.history(period="max")
-            spy_data = yf.Ticker("SPY").history(period="max")
-            if spy_data is None or spy_data.empty:
-                spy_data = yf.Ticker("SPY").history(period="10y")
-            st.session_state["spy_hist"] = spy_data
-            st.session_state["financials"]       = stock.financials
-            st.session_state["quarterly_fin"]    = stock.quarterly_financials
-            st.session_state["cashflow"]         = stock.cashflow
-            st.session_state["quarterly_cf"]     = stock.quarterly_cashflow
-            st.session_state["recommendations"]  = stock.recommendations
-            st.session_state["news_list"]        = stock.news or []
+            import requests as _req
+
+            # ── FMP: quote, profile, price history, analyst targets, news ──
+            def _fmp(ep):
+                sep = "&" if "?" in ep else "?"
+                r = _req.get(f"https://financialmodelingprep.com/api/v3/{ep}{sep}apikey={FMP_API_KEY}", timeout=10)
+                return r.json() if r.ok else {}
+
+            def _fmp_v4(ep):
+                sep = "&" if "?" in ep else "?"
+                r = _req.get(f"https://financialmodelingprep.com/api/v4/{ep}{sep}apikey={FMP_API_KEY}", timeout=10)
+                return r.json() if r.ok else {}
+
+            quote_list   = _fmp(f"quote/{ticker_input}")
+            profile_list = _fmp(f"profile/{ticker_input}")
+            hist_raw     = _fmp(f"historical-price-full/{ticker_input}?serietype=line")
+            analyst      = _fmp(f"analyst-estimates/{ticker_input}?limit=1")
+            price_target = _fmp(f"price-target-consensus/{ticker_input}")
+            rec_raw      = _fmp(f"analyst-stock-recommendations/{ticker_input}?limit=20")
+            news_raw     = _fmp(f"stock_news?tickers={ticker_input}&limit=10")
+
+            quote   = quote_list[0]   if isinstance(quote_list,   list) and quote_list   else {}
+            profile = profile_list[0] if isinstance(profile_list, list) and profile_list else {}
+            pt      = price_target[0] if isinstance(price_target, list) and price_target else {}
+
+            # Build info dict mimicking yfinance structure
+            price        = quote.get("price") or quote.get("previousClose") or 0
+            mkt_cap      = quote.get("marketCap") or 0
+            pe_ratio     = quote.get("pe")
+            eps          = quote.get("eps")
+            target_price = pt.get("targetConsensus") or pt.get("targetMean")
+
+            info = {
+                "currentPrice":            price,
+                "marketCap":               mkt_cap,
+                "trailingPE":              pe_ratio,
+                "forwardPE":               quote.get("pe"),
+                "trailingEps":             eps,
+                "forwardEps":              eps,
+                "targetMeanPrice":         target_price,
+                "fiftyTwoWeekHigh":        quote.get("yearHigh"),
+                "fiftyTwoWeekLow":         quote.get("yearLow"),
+                "volume":                  quote.get("volume"),
+                "averageVolume":           quote.get("avgVolume"),
+                "beta":                    profile.get("beta"),
+                "shortName":               profile.get("companyName") or ticker_input,
+                "longName":                profile.get("companyName") or ticker_input,
+                "sector":                  profile.get("sector"),
+                "industry":                profile.get("industry"),
+                "longBusinessSummary":     profile.get("description"),
+                "website":                 profile.get("website"),
+                "dividendYield":           profile.get("lastDiv", 0) / price if price else 0,
+                "payoutRatio":             None,
+                "heldPercentInstitutions": None,
+                "shortPercentOfFloat":     None,
+                "sharesOutstanding":       profile.get("mktCap", 0) / price if price else 0,
+                "bookValue":               profile.get("bookValuePerShare"),
+                "priceToBook":             profile.get("priceToBook") or profile.get("price") ,
+                "enterpriseValue":         quote.get("marketCap"),
+                "enterpriseToEbitda":      None,
+                "profitMargins":           profile.get("netProfitMargin") or profile.get("profitMargin"),
+                "revenueGrowth":           None,
+                "earningsGrowth":          None,
+                "returnOnEquity":          profile.get("roe"),
+                "returnOnAssets":          profile.get("roa"),
+                "debtToEquity":            profile.get("debtToEquity"),
+                "currentRatio":            profile.get("currentRatio"),
+                "priceToSalesTrailing12Months": profile.get("priceToSalesRatio"),
+            }
+
+            # Build price history DataFrame
+            hist_data = hist_raw.get("historical", []) if isinstance(hist_raw, dict) else []
+            if hist_data:
+                hist_df = pd.DataFrame(hist_data)
+                hist_df["date"] = pd.to_datetime(hist_df["date"])
+                hist_df = hist_df.set_index("date").sort_index()
+                hist_df = hist_df.rename(columns={"close": "Close", "open": "Open",
+                                                   "high": "High", "low": "Low", "volume": "Volume"})
+            else:
+                hist_df = pd.DataFrame()
+
+            # Build news list mimicking yfinance structure
+            news_list = []
+            for n in (news_raw if isinstance(news_raw, list) else []):
+                news_list.append({
+                    "title":     n.get("title", ""),
+                    "publisher": n.get("site", ""),
+                    "link":      n.get("url", ""),
+                    "providerPublishTime": n.get("publishedDate", ""),
+                })
+
+            # Build recommendations mimicking yfinance
+            recs = None
+            if isinstance(rec_raw, list) and rec_raw:
+                recs = pd.DataFrame(rec_raw)
+
+            st.session_state["stock_info"]       = info
+            st.session_state["hist_full"]        = hist_df
+            st.session_state["financials"]       = None
+            st.session_state["quarterly_fin"]    = None
+            st.session_state["cashflow"]         = None
+            st.session_state["quarterly_cf"]     = None
+            st.session_state["recommendations"]  = recs
+            st.session_state["news_list"]        = news_list
             st.session_state["ticker_loaded"]    = ticker_input
             st.session_state["analysis_done"]    = True
             st.session_state["price_range"]      = "1Y"
-            # Fetch FMP 10-year data
-            try:
-                fmp_a, fmp_q = fetch_fmp_financials(ticker_input)
-                st.session_state["fmp_annual"]   = fmp_a
-                st.session_state["fmp_quarterly"]= fmp_q
-            except:
-                st.session_state["fmp_annual"]   = None
-                st.session_state["fmp_quarterly"]= None
+            st.session_state["stock_obj"]        = None
+
+            # FMP 10-year KPI data
+            fmp_a, fmp_q = fetch_fmp_financials(ticker_input)
+            st.session_state["fmp_annual"]   = fmp_a
+            st.session_state["fmp_quarterly"]= fmp_q
+
         except Exception as e:
             st.error(f"Error fetching data: {e}")
 
@@ -584,7 +674,7 @@ if st.session_state["analysis_done"]:
             if _sh is None:
                 for shares_key in ['Ordinary Shares Number', 'Share Issued', 'Common Stock']:
                     try:
-                        bs = stock.balance_sheet
+                        bs = None
                         if bs is not None and shares_key in bs.index:
                             _sh = bs.loc[shares_key].sort_index()
                             break
@@ -631,7 +721,7 @@ if st.session_state["analysis_done"]:
         if _rpo is None:
             for rpo_key in ['Remaining Performance Obligation', 'DeferredRevenue', 'Deferred Revenue']:
                 try:
-                    bs = stock.balance_sheet
+                    bs = None
                     if bs is not None and rpo_key in bs.index:
                         _rpo = bs.loc[rpo_key].sort_index()
                         break
@@ -718,7 +808,7 @@ if st.session_state["analysis_done"]:
             if _q_sh is None:
                 for shares_key in ['Ordinary Shares Number', 'Share Issued', 'Common Stock']:
                     try:
-                        qbs = stock.quarterly_balance_sheet
+                        qbs = None
                         if qbs is not None and shares_key in qbs.index:
                             _q_sh = qbs.loc[shares_key].sort_index()
                             break
@@ -765,7 +855,7 @@ if st.session_state["analysis_done"]:
         if _q_rpo is None:
             for rpo_key in ['Remaining Performance Obligation', 'DeferredRevenue', 'Deferred Revenue']:
                 try:
-                    qbs = stock.quarterly_balance_sheet
+                    qbs = None
                     if qbs is not None and rpo_key in qbs.index:
                         _q_rpo = qbs.loc[rpo_key].sort_index()
                         break
@@ -1120,16 +1210,16 @@ body{font-family:-apple-system,sans-serif;margin:0;padding:0;}
         import streamlit.components.v1 as components
         import json
 
-        # Build daily P/E from price history and trailing EPS from financials
-        if hist_full is not None and not hist_full.empty and financials is not None:
-            # Get annual EPS
-            eps_annual = None
+        # Build daily P/E from price history and FMP EPS data
+        _fmp_a_pe = st.session_state.get("fmp_annual") or {}
+        eps_annual = _fmp_a_pe.get("eps") if _fmp_a_pe else None
+        if eps_annual is None and financials is not None:
             for col in ['Basic EPS', 'Diluted EPS']:
                 if col in financials.index:
                     eps_annual = financials.loc[col].sort_index()
                     break
 
-            if eps_annual is not None and not eps_annual.empty:
+        if hist_full is not None and not hist_full.empty and eps_annual is not None and not eps_annual.empty:
                 ph = hist_full.copy()
                 ph["Date"] = pd.to_datetime(ph["Date"].dt.date if hasattr(ph["Date"].dt, "date") else ph["Date"])
                 ph = ph.sort_values("Date")
@@ -1257,8 +1347,6 @@ function switchPe(range){{
                     components.html(pe_html, height=420)
                 else:
                     st.info("Not enough price/EPS data to calculate P/E history.")
-            else:
-                st.info("No EPS data available to build P/E chart.")
         else:
             st.info("Insufficient data to build P/E chart.")
     except Exception as e:
