@@ -314,6 +314,10 @@ if st.session_state["analysis_done"]:
     balance_sheet  = st.session_state.get("balance_sheet")
     q_balance_sheet= st.session_state.get("q_balance_sheet")
 
+    # ── Company Name ──
+    company_name = info.get("longName") or info.get("shortName") or loaded_ticker
+    st.markdown(f"## {company_name} &nbsp;<span style='font-size:16px;color:#888;font-weight:400;'>({loaded_ticker})</span>", unsafe_allow_html=True)
+
     # ── Top metrics ──
     col1, col2, col3, col4 = st.columns(4)
     with col1:
